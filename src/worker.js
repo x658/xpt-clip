@@ -8,7 +8,7 @@
  * @author XPT Dev (https://xptdev.com)
  */
 
-const JWT_SECRET = 'xpt-clip-super-secure-jwt-secret-2026-v3';
+const JWT_SECRET = 'xpt-jwt-secret-key-2026-dynamic-invites-v2';
 
 export default {
   async fetch(request, env) {
