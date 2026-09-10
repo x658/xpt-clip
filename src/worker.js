@@ -690,9 +690,9 @@ const frontendHtml = `<!DOCTYPE html>
 
         <div style="display:flex; gap:10px; align-items:center; margin-bottom:16px;">
           <select id="clipTtl" style="flex:1;">
-            <option value="600">保存 10 分钟</option>
+            <option value="600" selected>保存 10 分钟</option>
             <option value="3600">保存 1 小时</option>
-            <option value="86400" selected>保存 24 小时</option>
+            <option value="86400">保存 24 小时</option>
             <option value="604800">保存 7 天</option>
           </select>
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:0;font-size:13px;user-select:none;">
