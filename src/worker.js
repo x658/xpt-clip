@@ -170,16 +170,38 @@ export default {
         return json({ error: '请先登录' }, 401);
       }
 
-      // GET /api/clips
-      if (request.method === 'GET') {
+      // 1. POST /api/clips/:id/share (Generate 4-digit code) - Matched specifically first!
+      const shareMatch = pathname.match(/^\/api\/clips\/([^\/]+)\/share$/);
+      if (shareMatch && request.method === 'POST') {
+        const clipId = shareMatch[1];
+        const randomCode = Math.floor(1000 + Math.random() * 9000).toString();
+        const thirtyMinLater = Date.now() + 1800 * 1000;
+
+        await env.DB.prepare(
+          'UPDATE clips SET share_code = ?, expires_at = CASE WHEN expires_at IS NULL OR expires_at < ? THEN ? ELSE expires_at END WHERE id = ? AND user_id = ?'
+        ).bind(randomCode, thirtyMinLater, thirtyMinLater, clipId, currentUser.userId).run();
+
+        return json({ success: true, shareCode: randomCode });
+      }
+
+      // 2. DELETE /api/clips/:id
+      const deleteMatch = pathname.match(/^\/api\/clips\/([^\/]+)$/);
+      if (deleteMatch && request.method === 'DELETE') {
+        const clipId = deleteMatch[1];
+        await env.DB.prepare('DELETE FROM clips WHERE id = ? AND user_id = ?').bind(clipId, currentUser.userId).run();
+        return json({ success: true });
+      }
+
+      // 3. GET /api/clips (List stream)
+      if (pathname === '/api/clips' && request.method === 'GET') {
         const rows = await env.DB.prepare(
           'SELECT id, type, title, content, filename, mime_type, file_size, burn_after_reading, share_code, expires_at, created_at FROM clips WHERE user_id = ? ORDER BY created_at DESC LIMIT 50'
         ).bind(currentUser.userId).all();
         return json({ success: true, clips: rows.results || [] });
       }
 
-      // POST /api/clips
-      if (request.method === 'POST') {
+      // 4. POST /api/clips (New clip)
+      if (pathname === '/api/clips' && request.method === 'POST') {
         try {
           const body = await request.json();
           const { type, content, filename, mimeType, fileSize, ttl, burn } = body;
@@ -195,47 +217,48 @@ export default {
             displayTitle = type === 'file' ? '上传文件' : (content.length > 30 ? content.slice(0, 30) + '...' : content);
           }
 
-          await env.DB.prepare(
-            'INSERT INTO clips (id, user_id, type, title, content, filename, mime_type, file_size, burn_after_reading, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-          ).bind(
-            clipId,
-            currentUser.userId,
-            type || 'text',
-            displayTitle,
-            content,
-            filename || '',
-            mimeType || 'text/plain',
-            fileSize || 0,
-            burn ? 1 : 0,
-            expiresAt,
-            Date.now()
-          ).run();
+          // Resilient insert: tries 11 columns, falls back to 10 columns if file_size column not yet added
+          try {
+            await env.DB.prepare(
+              'INSERT INTO clips (id, user_id, type, title, content, filename, mime_type, file_size, burn_after_reading, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            ).bind(
+              clipId,
+              currentUser.userId,
+              type || 'text',
+              displayTitle,
+              content,
+              filename || '',
+              mimeType || 'text/plain',
+              fileSize || 0,
+              burn ? 1 : 0,
+              expiresAt,
+              Date.now()
+            ).run();
+          } catch (insertErr) {
+            if (insertErr.message && insertErr.message.includes('file_size')) {
+              await env.DB.prepare(
+                'INSERT INTO clips (id, user_id, type, title, content, filename, mime_type, burn_after_reading, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+              ).bind(
+                clipId,
+                currentUser.userId,
+                type || 'text',
+                displayTitle,
+                content,
+                filename || '',
+                mimeType || 'text/plain',
+                burn ? 1 : 0,
+                expiresAt,
+                Date.now()
+              ).run();
+            } else {
+              throw insertErr;
+            }
+          }
 
           return json({ success: true, id: clipId });
         } catch (err) {
           return json({ error: '保存失败: ' + err.message }, 500);
         }
-      }
-
-      // POST /api/clips/:id/share (Generate 4-digit code)
-      if (pathname.endsWith('/share') && request.method === 'POST') {
-        const clipId = pathname.split('/')[3];
-        const randomCode = Math.floor(1000 + Math.random() * 9000).toString();
-        // Guest code is valid for 30 minutes
-        const expireTime = Date.now() + 1800 * 1000;
-
-        await env.DB.prepare(
-          'UPDATE clips SET share_code = ?, expires_at = ? WHERE id = ? AND user_id = ?'
-        ).bind(randomCode, expireTime, clipId, currentUser.userId).run();
-
-        return json({ success: true, shareCode: randomCode });
-      }
-
-      // DELETE /api/clips/:id
-      if (request.method === 'DELETE') {
-        const clipId = pathname.split('/')[3];
-        await env.DB.prepare('DELETE FROM clips WHERE id = ? AND user_id = ?').bind(clipId, currentUser.userId).run();
-        return json({ success: true });
       }
     }
 
@@ -723,6 +746,8 @@ const frontendHtml = `<!DOCTYPE html>
     let currentAuthTab = 'login';
     let selectedFileObject = null;
     let lastGeneratedShareCode = '';
+    let cachedClips = {};
+    let currentGuestText = '';
 
     // ==========================================
     // UI Notification (Toast) System
@@ -769,7 +794,6 @@ const frontendHtml = `<!DOCTYPE html>
 
     // Global Ctrl+V clipboard grabber (Images / Text)
     window.addEventListener('paste', (e) => {
-      // If user is typing in input or textarea, let normal paste happen unless it's an image
       const activeEl = document.activeElement;
       const isInput = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA');
 
@@ -810,10 +834,31 @@ const frontendHtml = `<!DOCTYPE html>
       showToast('已载入文件: ' + file.name, 'success');
     }
 
+    // Bind specific drop zone
+    function bindDropZone() {
+      const zone = document.getElementById('fileDropZone');
+      if (!zone) return;
+      zone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        zone.classList.add('dragover');
+      });
+      zone.addEventListener('dragleave', () => {
+        zone.classList.remove('dragover');
+      });
+      zone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+        if (e.dataTransfer && e.dataTransfer.files) {
+          handleFileSelect(e.dataTransfer.files);
+        }
+      });
+    }
+
     // ==========================================
     // Auth & Navigation
     // ==========================================
     function initApp() {
+      bindDropZone();
       const token = localStorage.getItem('xpt_token');
       const user = localStorage.getItem('xpt_user');
       const role = localStorage.getItem('xpt_role');
@@ -1002,6 +1047,10 @@ const frontendHtml = `<!DOCTYPE html>
         return;
       }
 
+      // Populate cache for safe one-click copy
+      cachedClips = {};
+      data.clips.forEach(c => { cachedClips[c.id] = c; });
+
       container.innerHTML = data.clips.map(c => {
         const isImg = c.type === 'image';
         const isFile = c.type === 'file' || isImg;
@@ -1020,7 +1069,7 @@ const frontendHtml = `<!DOCTYPE html>
             <div class="clip-actions">
               \${isFile ? 
                 \`<a class="btn-sm" href="\${c.content}" download="\${escapeHtml(c.filename)}">⬇️ 下载文件</a>\` :
-                \`<button class="btn-sm" onclick="copyPureText(\\\`\${escapeAttr(c.content)}\\\`)">📋 一键复制</button>\`
+                \`<button class="btn-sm" onclick="copyClipById('\${c.id}')">📋 一键复制</button>\`
               }
               <button class="btn-sm" style="color:var(--accent);" onclick="requestShareCode('\${c.id}')">🔗 生成临时提取码</button>
               <button class="btn-sm" style="color:var(--danger);" onclick="deleteClipItem('\${c.id}')">🗑️ 删除</button>
@@ -1030,6 +1079,13 @@ const frontendHtml = `<!DOCTYPE html>
       }).join('');
 
       if (manual) showToast('已同步最新数据', 'success');
+    }
+
+    function copyClipById(id) {
+      const item = cachedClips[id];
+      if (item && item.content) {
+        copyPureText(item.content);
+      }
     }
 
     async function requestShareCode(id) {
@@ -1059,10 +1115,8 @@ const frontendHtml = `<!DOCTYPE html>
 
     function copyShareCode() {
       const text = '我在 XPT 快传给你发了文件，请打开网址 ' + window.location.origin + ' 并输入 4 位提取码：' + lastGeneratedShareCode;
-      navigator.clipboard.writeText(text).then(() => {
-        showToast('已复制提取码及说明到剪贴板！', 'success');
-        closeShareModal();
-      });
+      copyPureText(text);
+      closeShareModal();
     }
 
     async function deleteClipItem(id) {
@@ -1136,6 +1190,7 @@ const frontendHtml = `<!DOCTYPE html>
         const btn = document.getElementById('btnGuestCopy');
 
         modal.style.display = 'flex';
+        currentGuestText = item.content;
 
         if (item.type === 'file' || item.type === 'image') {
           area.innerHTML = \`
@@ -1147,7 +1202,7 @@ const frontendHtml = `<!DOCTYPE html>
           \`;
           btn.style.display = 'none';
         } else {
-          area.innerHTML = \`<div class="clip-content" style="max-height:220px;" id="guestTextVal">\${escapeHtml(item.content)}</div>\`;
+          area.innerHTML = \`<div class="clip-content" style="max-height:220px;">\${escapeHtml(item.content)}</div>\`;
           btn.style.display = 'block';
         }
       } catch (err) {
@@ -1160,29 +1215,43 @@ const frontendHtml = `<!DOCTYPE html>
     }
 
     function copyGuestResult() {
-      const el = document.getElementById('guestTextVal');
-      if (el) copyPureText(el.innerText);
+      if (currentGuestText) copyPureText(currentGuestText);
     }
 
     // ==========================================
-    // Helper String Escapes
+    // Reliable Clipboard Copy with Fallback
     // ==========================================
     function copyPureText(str) {
-      navigator.clipboard.writeText(str).then(() => {
-        showToast('📋 已成功复制到剪贴板！', 'success');
-      }).catch(() => {
-        showToast('复制受限，请长按文本手动复制', 'error');
-      });
+      if (!str) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(str).then(() => {
+          showToast('📋 已成功复制到剪贴板！', 'success');
+        }).catch(() => fallbackCopy(str));
+      } else {
+        fallbackCopy(str);
+      }
+    }
+
+    function fallbackCopy(str) {
+      const ta = document.createElement('textarea');
+      ta.value = str;
+      ta.style.position = 'fixed';
+      ta.style.top = '-9999px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      try {
+        document.execCommand('copy');
+        showToast('📋 已复制到剪贴板！', 'success');
+      } catch (e) {
+        showToast('复制受限，请手动长按复制', 'error');
+      }
+      document.body.removeChild(ta);
     }
 
     function escapeHtml(s) {
       if (!s) return '';
       return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-
-    function escapeAttr(s) {
-      if (!s) return '';
-      return s.replace(/\\\\/g, '\\\\\\\\').replace(/\`/g, '\\\\\`').replace(/\\$/g, '\\\\$');
     }
 
     window.onload = initApp;
