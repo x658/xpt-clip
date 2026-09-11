@@ -1,0 +1,23 @@
+name = "xpt-clip"
+main = "src/worker.js"
+compatibility_date = "2024-09-01"
+compatibility_flags = [ "nodejs_compat" ]
+
+# Custom Domain Routing
+routes = [
+  { pattern = "clip.yourdomain.com", custom_domain = true }
+]
+
+# Cloudflare D1 Database Binding
+[[d1_databases]]
+binding = "DB"
+database_name = "clip-db"
+database_id = "your-database-id-from-cloudflare"
+
+# 100% Card-Free Architecture:
+# - Small files & text (<2MB): Stored in private D1 SQLite database
+# - Large files (>2MB up to 1GB): Uploaded to high-stability relay with dual-provider fallback
+# (Optional R2 binding can be enabled if you have a card, but is NOT required)
+# [[r2_buckets]]
+# binding = "BUCKET"
+# bucket_name = "clip-files"
