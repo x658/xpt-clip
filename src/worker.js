@@ -144,8 +144,49 @@ export default {
 
       const shouldBurn = clip.burn_after_reading === 1;
 
-      // Case 0: High-Stability Card-Free Relay URL (Litterbox / Tmpfiles)
+      // Case 0: High-Stability Relay URL (Tmpfiles / Filebin) -> Transparent Cloudflare Edge Stream
       if (clip.content && (clip.content.startsWith('http://') || clip.content.startsWith('https://'))) {
+        try {
+          let streamUrl = clip.content;
+          // If Tmpfiles landing page, resolve the actual direct download URL
+          if (clip.content.includes('tmpfiles.org') && !clip.content.includes('/dl/')) {
+            const pageRes = await fetch(clip.content);
+            if (pageRes.ok) {
+              const html = await pageRes.text();
+              const m = html.match(/https:\/\/tmpfiles\.org\/dl\/[^\s"'>]+/);
+              if (m) streamUrl = m[0];
+            }
+          }
+
+          const upstreamRes = await fetch(streamUrl, {
+            redirect: 'follow',
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Referer': clip.content
+            }
+          });
+
+          if (upstreamRes.ok) {
+            if (shouldBurn) {
+              await env.DB.prepare('DELETE FROM clips WHERE id = ?').bind(clip.id).run();
+            }
+
+            const headers = new Headers();
+            headers.set('Content-Type', clip.mime_type || upstreamRes.headers.get('Content-Type') || 'application/octet-stream');
+            if (searchParams.get('download') === '1') {
+              headers.set('Content-Disposition', `attachment; filename="${encodeURIComponent(clip.filename || 'download')}"`);
+            } else {
+              headers.set('Content-Disposition', `inline; filename="${encodeURIComponent(clip.filename || 'preview')}"`);
+            }
+            const len = clip.file_size || upstreamRes.headers.get('Content-Length');
+            if (len) headers.set('Content-Length', len.toString());
+            return new Response(upstreamRes.body, { headers });
+          }
+        } catch (err) {
+          console.error('Edge streaming proxy error:', err);
+        }
+
+        // Fallback: If streaming proxy fails, redirect
         if (shouldBurn) {
           await env.DB.prepare('DELETE FROM clips WHERE id = ?').bind(clip.id).run();
         }
@@ -1251,13 +1292,9 @@ const frontendHtml = `<!DOCTYPE html>
         btn.innerText = '🚀 直传中 ' + percent + '% (' + currentSpeed + ')';
       };
 
-      // 线路 1: Filebin (AWS S3 专线存储，6天持久留存，全直链极速下载)
+      // 线路 1: Tmpfiles.org (依托 Cloudflare CDN 亚太边缘节点加速，极速无拦截)
       let directUrl = '';
       try {
-        const binId = 'xpt_' + Math.random().toString(36).slice(2, 10);
-        const cleanFileName = encodeURIComponent(file.name.replace(/[^a-zA-Z0-9._-]/g, '_'));
-        const targetUrl = 'https://filebin.net/' + binId + '/' + cleanFileName;
-
         directUrl = await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
           lastTime = Date.now();
@@ -1266,32 +1303,45 @@ const frontendHtml = `<!DOCTYPE html>
 
           xhr.onreadystatechange = () => {
             if (xhr.readyState === 4) {
-              if (xhr.status === 201 || xhr.status === 200) {
-                resolve(targetUrl);
+              if (xhr.status === 200) {
+                try {
+                  const res = JSON.parse(xhr.responseText);
+                  if (res.status === 'success' && res.data && res.data.url) {
+                    resolve(res.data.url);
+                  } else {
+                    reject(new Error('Tmpfiles 数据解析异常'));
+                  }
+                } catch (e) {
+                  reject(e);
+                }
               } else {
-                reject(new Error('Filebin 响应状态: ' + xhr.status));
+                reject(new Error('Tmpfiles 响应状态: ' + xhr.status));
               }
             }
           };
-          xhr.onerror = () => reject(new Error('Filebin 网络连接异常'));
-          xhr.ontimeout = () => reject(new Error('Filebin 上传超时'));
+          xhr.onerror = () => reject(new Error('Tmpfiles 网络异常'));
+          xhr.ontimeout = () => reject(new Error('Tmpfiles 超时'));
           xhr.timeout = 300000;
 
-          xhr.open('POST', targetUrl, true);
-          xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-          xhr.setRequestHeader('filename', cleanFileName);
-          xhr.send(file);
+          const fd = new FormData();
+          fd.append('file', file);
+          xhr.open('POST', 'https://tmpfiles.org/api/v1/upload', true);
+          xhr.send(fd);
         });
       } catch (err) {
-        console.warn('Filebin 线路直传遇阻，无缝切换 Tmpfiles 备用线路:', err);
+        console.warn('Tmpfiles 线路直传遇阻，无缝切换 Filebin 备用线路:', err);
       }
 
-      // 线路 2: Tmpfiles.org (Cloudflare CDN 亚洲东京边缘节点)
+      // 线路 2: Filebin.net (AWS S3 专线存储，备用容灾)
       if (!directUrl) {
         try {
-          updateUploadProgress(0, '0 MB', totalStr, '切换中...', '⚡ 切换备用通道 (Cloudflare 边缘中转)...');
+          updateUploadProgress(0, '0 MB', totalStr, '切换中...', '⚡ 切换备用通道 (AWS 专线存储)...');
           lastTime = Date.now();
           lastLoaded = 0;
+
+          const binId = 'xpt_' + Math.random().toString(36).slice(2, 10);
+          const cleanFileName = encodeURIComponent(file.name.replace(/[^a-zA-Z0-9._-]/g, '_'));
+          const targetUrl = 'https://filebin.net/' + binId + '/' + cleanFileName;
 
           directUrl = await new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
@@ -1299,33 +1349,24 @@ const frontendHtml = `<!DOCTYPE html>
 
             xhr.onreadystatechange = () => {
               if (xhr.readyState === 4) {
-                if (xhr.status === 200) {
-                  try {
-                    const res = JSON.parse(xhr.responseText);
-                    if (res.status === 'success' && res.data && res.data.url) {
-                      resolve(res.data.url);
-                    } else {
-                      reject(new Error('Tmpfiles 数据解析异常'));
-                    }
-                  } catch (e) {
-                    reject(e);
-                  }
+                if (xhr.status === 201 || xhr.status === 200) {
+                  resolve(targetUrl);
                 } else {
-                  reject(new Error('Tmpfiles 响应状态: ' + xhr.status));
+                  reject(new Error('Filebin 响应状态: ' + xhr.status));
                 }
               }
             };
-            xhr.onerror = () => reject(new Error('Tmpfiles 网络异常'));
-            xhr.ontimeout = () => reject(new Error('Tmpfiles 超时'));
+            xhr.onerror = () => reject(new Error('Filebin 网络连接异常'));
+            xhr.ontimeout = () => reject(new Error('Filebin 上传超时'));
             xhr.timeout = 300000;
 
-            const fd = new FormData();
-            fd.append('file', file);
-            xhr.open('POST', 'https://tmpfiles.org/api/v1/upload', true);
-            xhr.send(fd);
+            xhr.open('POST', targetUrl, true);
+            xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+            xhr.setRequestHeader('filename', cleanFileName);
+            xhr.send(file);
           });
         } catch (err) {
-          console.warn('Tmpfiles 备用线路直传遇阻:', err);
+          console.warn('Filebin 备用线路直传遇阻:', err);
         }
       }
 
@@ -1494,9 +1535,7 @@ const frontendHtml = `<!DOCTYPE html>
           (c.content.startsWith('data:') ? c.content : '/api/files/' + c.id);
         const sizeStr = c.file_size ? 
           (c.file_size > 1024 * 1024 * 1024 ? (c.file_size / (1024 * 1024 * 1024)).toFixed(2) + ' GB' : (c.file_size > 1024 * 1024 ? (c.file_size / (1024 * 1024)).toFixed(1) + ' MB' : (c.file_size / 1024).toFixed(0) + ' KB')) : '';
-        const downloadUrl = (c.burn_after_reading === 1 || !c.content.startsWith('http')) ? 
-          ('/api/files/' + c.id + '?download=1') : 
-          (fileUrl + (fileUrl.includes('?') ? '&download=1' : '?download=1'));
+        const downloadUrl = '/api/files/' + c.id + '?download=1';
 
         return \`
           <div class="clip-item">
@@ -1639,9 +1678,7 @@ const frontendHtml = `<!DOCTYPE html>
           const fileUrl = (item.content.startsWith('http://') || item.content.startsWith('https://')) ? 
             item.content : 
             (item.content.startsWith('data:') ? item.content : '/api/files/' + item.id);
-          const downloadUrl = (item.burn_after_reading === 1 || !item.content.startsWith('http')) ? 
-            ('/api/files/' + item.id + '?download=1') : 
-            (fileUrl + (fileUrl.includes('?') ? '&download=1' : '?download=1'));
+          const downloadUrl = '/api/files/' + item.id + '?download=1';
           area.innerHTML = \`
             <div style="text-align:center;padding:12px 0;">
               \${item.type === 'image' ? \`<img src="\${fileUrl}" style="max-height:160px;border-radius:8px;margin-bottom:12px;border:1px solid var(--border);">\` : '<div style="font-size:36px;margin-bottom:8px;">📦</div>'}
