@@ -53,8 +53,8 @@
                │ SQL (≤2MB & Metadata)        │ High-Stability Stream (>2MB)
                ▼                              ▼
 ┌──────────────────────────────┐ ┌────────────────────────────┐
-│ Cloudflare D1 (Private DB)   │ │ 9-Year Veteran Relay       │
-│ · users & invites tables     │ │ · Primary: Litterbox (1GB) │
+│ Cloudflare D1 (Private DB)   │ │ High-Speed Dual Relay (1GB)│
+│ · users & invites tables     │ │ · Primary: Filebin (AWS S3)│
 │ · clips records & text       │ │ · Backup: Tmpfiles.org     │
 └──────────────────────────────┘ └────────────────────────────┘
 ```

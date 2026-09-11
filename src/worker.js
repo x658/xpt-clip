@@ -307,12 +307,12 @@ export default {
             type = mimeType.startsWith('image/') ? 'image' : 'file';
             displayTitle = filename;
 
-            if (fileSize > 100 * 1024 * 1024) {
-              return json({ error: '文件过大，单文件上限为 100MB' }, 400);
+            if (fileSize > 1024 * 1024 * 1024) {
+              return json({ error: '文件过大，单文件上限为 1GB' }, 400);
             }
 
             if (fileSize <= 2 * 1024 * 1024) {
-              // Engine 1: Pure D1 (< 2MB) - 100% Private in edge SQLite
+              // Engine 1: Pure D1 (<= 2MB) - 100% Private in edge SQLite
               const buffer = await file.arrayBuffer();
               const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
               content = `data:${mimeType};base64,${base64}`;
@@ -325,30 +325,27 @@ export default {
               });
               content = r2Key;
             } else {
-              // Engine 2: Card-Free High-Stability Relay (Up to 1GB)
-              // Primary: Litterbox (by Catbox.moe) - 1GB limit, 9 years uptime since 2017
+              // Engine 2: Card-Free High-Stability Dual Relay (Up to 1GB)
+              // Primary Relay: Filebin.net (AWS S3 storage, 6-day retention, direct download)
               try {
-                const litterForm = new FormData();
-                litterForm.append('reqtype', 'fileupload');
-                litterForm.append('time', '24h');
-                litterForm.append('fileToUpload', file, filename);
-
-                const litterRes = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
+                const binId = 'xpt_' + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+                const safeName = encodeURIComponent(filename.replace(/[^a-zA-Z0-9._-]/g, '_'));
+                const filebinRes = await fetch(`https://filebin.net/${binId}/${safeName}`, {
                   method: 'POST',
-                  body: litterForm
+                  headers: {
+                    'Content-Type': mimeType,
+                    'filename': safeName
+                  },
+                  body: file.stream()
                 });
-
-                if (litterRes.ok) {
-                  const urlText = (await litterRes.text()).trim();
-                  if (urlText.startsWith('http://') || urlText.startsWith('https://')) {
-                    content = urlText;
-                  }
+                if (filebinRes.status === 201 || filebinRes.ok) {
+                  content = `https://filebin.net/${binId}/${safeName}`;
                 }
               } catch (err) {
-                console.error('Litterbox upload error, attempting fallback:', err);
+                console.error('Filebin backend relay upload error:', err);
               }
 
-              // Backup Fallback: Tmpfiles.org
+              // Backup Fallback: Tmpfiles.org (Cloudflare CDN)
               if (!content) {
                 try {
                   const tmpForm = new FormData();
@@ -360,7 +357,7 @@ export default {
                   if (tmpRes.ok) {
                     const tmpData = await tmpRes.json();
                     if (tmpData.status === 'success' && tmpData.data?.url) {
-                      content = tmpData.data.url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+                      content = tmpData.data.url;
                     }
                   }
                 } catch (err) {
@@ -686,6 +683,30 @@ const frontendHtml = `<!DOCTYPE html>
     }
     body.dragging .drag-full-mask { display: flex; }
 
+    /* Upload Progress Box */
+    .progress-box {
+      background: #080c14;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-top: 10px;
+    }
+    .progress-bar-bg {
+      width: 100%;
+      height: 7px;
+      background: #192237;
+      border-radius: 6px;
+      overflow: hidden;
+      margin: 7px 0;
+    }
+    .progress-bar-fill {
+      width: 0%;
+      height: 100%;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+      border-radius: 6px;
+      transition: width 0.15s ease;
+    }
+
     /* Clip Item in Stream */
     .clip-item {
       background: #090d16;
@@ -872,6 +893,20 @@ const frontendHtml = `<!DOCTYPE html>
           <div class="file-drop" id="fileDropZone" onclick="document.getElementById('hiddenFileInput').click()">
             <span id="fileDropLabel">📁 点击选择文件 或 拖放文件到此 (最大 1GB，传完即可关机)</span>
             <input type="file" id="hiddenFileInput" style="display:none;" onchange="handleFileSelect(this.files)">
+          </div>
+          <!-- 实时上传进度与速率面板 -->
+          <div class="progress-box" id="uploadProgressBox" style="display:none;">
+            <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:2px;">
+              <span id="progressStatusText" style="color:var(--primary);font-weight:600;">⚡ 正在开启高速直传...</span>
+              <span id="progressPercentText" style="color:var(--accent);font-weight:700;">0%</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill" id="progressBarInner"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);">
+              <span id="progressBytesText">0 MB / 0 MB</span>
+              <span id="progressSpeedText" style="color:var(--primary);font-family:monospace;font-weight:600;">0 MB/s</span>
+            </div>
           </div>
         </div>
 
@@ -1154,6 +1189,149 @@ const frontendHtml = `<!DOCTYPE html>
       loadClips();
     }
 
+    function showUploadProgress(show) {
+      const box = document.getElementById('uploadProgressBox');
+      if (box) box.style.display = show ? 'block' : 'none';
+      if (!show) {
+        const bar = document.getElementById('progressBarInner');
+        if (bar) bar.style.width = '0%';
+      }
+    }
+
+    function updateUploadProgress(percent, loadedStr, totalStr, speedStr, statusText) {
+      const bar = document.getElementById('progressBarInner');
+      const txtPercent = document.getElementById('progressPercentText');
+      const txtBytes = document.getElementById('progressBytesText');
+      const txtSpeed = document.getElementById('progressSpeedText');
+      const txtStatus = document.getElementById('progressStatusText');
+
+      if (bar) bar.style.width = percent + '%';
+      if (txtPercent) txtPercent.innerText = percent + '%';
+      if (txtBytes) txtBytes.innerText = loadedStr + ' / ' + totalStr;
+      if (txtSpeed) txtSpeed.innerText = speedStr;
+      if (txtStatus && statusText) txtStatus.innerText = statusText;
+    }
+
+    function readFileAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function uploadLargeFileDirect(file) {
+      const totalMB = (file.size / (1024 * 1024)).toFixed(1);
+      const totalStr = file.size > 1024 * 1024 * 1024 ? 
+        (file.size / (1024 * 1024 * 1024)).toFixed(2) + ' GB' : totalMB + ' MB';
+
+      showUploadProgress(true);
+      updateUploadProgress(0, '0 MB', totalStr, '测速中...', '⚡ 正在开启高速专线直传...');
+
+      let lastTime = Date.now();
+      let lastLoaded = 0;
+      let currentSpeed = '计算中...';
+
+      const onProgressHandler = (e) => {
+        if (!e.lengthComputable) return;
+        const now = Date.now();
+        const dt = (now - lastTime) / 1000;
+        if (dt >= 0.25) {
+          const bytesPerSec = (e.loaded - lastLoaded) / dt;
+          const mbPerSec = bytesPerSec / (1024 * 1024);
+          currentSpeed = mbPerSec >= 1 ? mbPerSec.toFixed(1) + ' MB/s' : (bytesPerSec / 1024).toFixed(0) + ' KB/s';
+          lastTime = now;
+          lastLoaded = e.loaded;
+        }
+        const percent = Math.min(99, Math.round((e.loaded / e.total) * 100));
+        const loadedMB = (e.loaded / (1024 * 1024)).toFixed(1) + ' MB';
+        updateUploadProgress(percent, loadedMB, totalStr, currentSpeed, '⚡ 专线直传进行中...');
+        const btn = document.getElementById('btnPublish');
+        btn.innerText = '🚀 直传中 ' + percent + '% (' + currentSpeed + ')';
+      };
+
+      // 线路 1: Filebin (AWS S3 专线存储，6天持久留存，全直链极速下载)
+      let directUrl = '';
+      try {
+        const binId = 'xpt_' + Math.random().toString(36).slice(2, 10);
+        const cleanFileName = encodeURIComponent(file.name.replace(/[^a-zA-Z0-9._-]/g, '_'));
+        const targetUrl = 'https://filebin.net/' + binId + '/' + cleanFileName;
+
+        directUrl = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          lastTime = Date.now();
+          lastLoaded = 0;
+          xhr.upload.addEventListener('progress', onProgressHandler);
+
+          xhr.onreadystatechange = () => {
+            if (xhr.readyState === 4) {
+              if (xhr.status === 201 || xhr.status === 200) {
+                resolve(targetUrl);
+              } else {
+                reject(new Error('Filebin 响应状态: ' + xhr.status));
+              }
+            }
+          };
+          xhr.onerror = () => reject(new Error('Filebin 网络连接异常'));
+          xhr.ontimeout = () => reject(new Error('Filebin 上传超时'));
+          xhr.timeout = 300000;
+
+          xhr.open('POST', targetUrl, true);
+          xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+          xhr.setRequestHeader('filename', cleanFileName);
+          xhr.send(file);
+        });
+      } catch (err) {
+        console.warn('Filebin 线路直传遇阻，无缝切换 Tmpfiles 备用线路:', err);
+      }
+
+      // 线路 2: Tmpfiles.org (Cloudflare CDN 亚洲东京边缘节点)
+      if (!directUrl) {
+        try {
+          updateUploadProgress(0, '0 MB', totalStr, '切换中...', '⚡ 切换备用通道 (Cloudflare 边缘中转)...');
+          lastTime = Date.now();
+          lastLoaded = 0;
+
+          directUrl = await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.upload.addEventListener('progress', onProgressHandler);
+
+            xhr.onreadystatechange = () => {
+              if (xhr.readyState === 4) {
+                if (xhr.status === 200) {
+                  try {
+                    const res = JSON.parse(xhr.responseText);
+                    if (res.status === 'success' && res.data && res.data.url) {
+                      resolve(res.data.url);
+                    } else {
+                      reject(new Error('Tmpfiles 数据解析异常'));
+                    }
+                  } catch (e) {
+                    reject(e);
+                  }
+                } else {
+                  reject(new Error('Tmpfiles 响应状态: ' + xhr.status));
+                }
+              }
+            };
+            xhr.onerror = () => reject(new Error('Tmpfiles 网络异常'));
+            xhr.ontimeout = () => reject(new Error('Tmpfiles 超时'));
+            xhr.timeout = 300000;
+
+            const fd = new FormData();
+            fd.append('file', file);
+            xhr.open('POST', 'https://tmpfiles.org/api/v1/upload', true);
+            xhr.send(fd);
+          });
+        } catch (err) {
+          console.warn('Tmpfiles 备用线路直传遇阻:', err);
+        }
+      }
+
+      return directUrl;
+    }
+
     // ==========================================
     // Clip Stream Operations
     // ==========================================
@@ -1170,58 +1348,67 @@ const frontendHtml = `<!DOCTYPE html>
 
       try {
         if (selectedFileObject) {
-          const sizeStr = selectedFileObject.size > 1024 * 1024 * 1024 ? 
-            (selectedFileObject.size / (1024 * 1024 * 1024)).toFixed(2) + ' GB' : 
-            (selectedFileObject.size > 1024 * 1024 ? (selectedFileObject.size / (1024 * 1024)).toFixed(1) + ' MB' : (selectedFileObject.size / 1024).toFixed(0) + ' KB');
-          btn.innerText = '正在极速中转 (' + sizeStr + ')...';
+          const file = selectedFileObject;
+          const sizeStr = file.size > 1024 * 1024 * 1024 ? 
+            (file.size / (1024 * 1024 * 1024)).toFixed(2) + ' GB' : 
+            (file.size > 1024 * 1024 ? (file.size / (1024 * 1024)).toFixed(1) + ' MB' : (file.size / 1024).toFixed(0) + ' KB');
 
-          // If file > 80MB, upload directly to Litterbox from browser to bypass Worker 100MB body limit
-          if (selectedFileObject.size > 80 * 1024 * 1024) {
-            btn.innerText = '正在大文件直传 (' + sizeStr + ')...';
-            const directForm = new FormData();
-            directForm.append('reqtype', 'fileupload');
-            directForm.append('time', '24h');
-            directForm.append('fileToUpload', selectedFileObject);
-
-            let directUrl = '';
-            try {
-              const directRes = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
-                method: 'POST',
-                body: directForm
-              });
-              if (directRes.ok) {
-                const txt = (await directRes.text()).trim();
-                if (txt.startsWith('http://') || txt.startsWith('https://')) directUrl = txt;
-              }
-            } catch (err) {
-              console.warn('Direct upload error:', err);
-            }
-
-            if (directUrl) {
-              const res = await fetch('/api/clips', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': 'Bearer ' + token
-                },
-                body: JSON.stringify({
-                  type: selectedFileObject.type.startsWith('image/') ? 'image' : 'file',
-                  content: directUrl,
-                  filename: selectedFileObject.name,
-                  mimeType: selectedFileObject.type,
-                  fileSize: selectedFileObject.size,
-                  ttl: document.getElementById('clipTtl').value,
-                  burn: document.getElementById('clipBurn').checked
-                })
-              });
-              const data = await res.json();
-              handlePublishResponse(data);
-              return;
-            }
+          // 分支 A: <= 2MB 小文件/纯文本 -> 纯 D1 边缘离线存储，100% 本地隐私极速入库 (100~200ms)
+          if (file.size <= 2 * 1024 * 1024) {
+            btn.innerText = '正在存入边缘离线存储 (' + sizeStr + ')...';
+            const dataUrl = await readFileAsDataUrl(file);
+            const res = await fetch('/api/clips', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + token
+              },
+              body: JSON.stringify({
+                type: file.type.startsWith('image/') ? 'image' : 'file',
+                content: dataUrl,
+                filename: file.name,
+                mimeType: file.type,
+                fileSize: file.size,
+                ttl: document.getElementById('clipTtl').value,
+                burn: document.getElementById('clipBurn').checked
+              })
+            });
+            const data = await res.json();
+            handlePublishResponse(data);
+            return;
           }
 
+          // 分支 B: > 2MB ~ 1GB 大文件 -> 客户端单跳直传 + 动态实时百分比/速率监控
+          btn.innerText = '正在专线直传 (' + sizeStr + ')...';
+          let directUrl = await uploadLargeFileDirect(file);
+
+          if (directUrl) {
+            updateUploadProgress(100, sizeStr, sizeStr, '完成', '✅ 专线直传完毕，正在同步剪贴板...');
+            const res = await fetch('/api/clips', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + token
+              },
+              body: JSON.stringify({
+                type: file.type.startsWith('image/') ? 'image' : 'file',
+                content: directUrl,
+                filename: file.name,
+                mimeType: file.type,
+                fileSize: file.size,
+                ttl: document.getElementById('clipTtl').value,
+                burn: document.getElementById('clipBurn').checked
+              })
+            });
+            const data = await res.json();
+            handlePublishResponse(data);
+            return;
+          }
+
+          // 分支 C (终极保底): 如果浏览器直传受局域网拦截，通过 Worker 进行兜底中转
+          btn.innerText = '正在通过边缘服务器中转 (' + sizeStr + ')...';
           const fd = new FormData();
-          fd.append('file', selectedFileObject);
+          fd.append('file', file);
           fd.append('ttl', document.getElementById('clipTtl').value);
           if (document.getElementById('clipBurn').checked) {
             fd.append('burn', '1');
@@ -1255,6 +1442,7 @@ const frontendHtml = `<!DOCTYPE html>
           handlePublishResponse(data);
         }
       } catch (e) {
+        showUploadProgress(false);
         showToast('发送失败: ' + e.message, 'error');
         btn.innerText = '🚀 发送到我的私密流';
         btn.disabled = false;
@@ -1265,6 +1453,7 @@ const frontendHtml = `<!DOCTYPE html>
       const btn = document.getElementById('btnPublish');
       btn.innerText = '🚀 发送到我的私密流';
       btn.disabled = false;
+      showUploadProgress(false);
 
       if (data.success) {
         document.getElementById('clipText').value = '';
@@ -1305,6 +1494,9 @@ const frontendHtml = `<!DOCTYPE html>
           (c.content.startsWith('data:') ? c.content : '/api/files/' + c.id);
         const sizeStr = c.file_size ? 
           (c.file_size > 1024 * 1024 * 1024 ? (c.file_size / (1024 * 1024 * 1024)).toFixed(2) + ' GB' : (c.file_size > 1024 * 1024 ? (c.file_size / (1024 * 1024)).toFixed(1) + ' MB' : (c.file_size / 1024).toFixed(0) + ' KB')) : '';
+        const downloadUrl = (c.burn_after_reading === 1 || !c.content.startsWith('http')) ? 
+          ('/api/files/' + c.id + '?download=1') : 
+          (fileUrl + (fileUrl.includes('?') ? '&download=1' : '?download=1'));
 
         return \`
           <div class="clip-item">
@@ -1319,7 +1511,7 @@ const frontendHtml = `<!DOCTYPE html>
 
             <div class="clip-actions">
               \${isFile ? 
-                \`<a class="btn-sm" href="\${fileUrl}?download=1" download="\${escapeHtml(c.filename)}">⬇️ 下载文件</a>\` :
+                \`<a class="btn-sm" href="\${downloadUrl}" download="\${escapeHtml(c.filename)}">⬇️ 下载文件</a>\` :
                 \`<button class="btn-sm" onclick="copyClipById('\${c.id}')">📋 一键复制</button>\`
               }
               <button class="btn-sm" style="color:var(--accent);" onclick="requestShareCode('\${c.id}')">🔗 生成临时提取码</button>
@@ -1447,11 +1639,14 @@ const frontendHtml = `<!DOCTYPE html>
           const fileUrl = (item.content.startsWith('http://') || item.content.startsWith('https://')) ? 
             item.content : 
             (item.content.startsWith('data:') ? item.content : '/api/files/' + item.id);
+          const downloadUrl = (item.burn_after_reading === 1 || !item.content.startsWith('http')) ? 
+            ('/api/files/' + item.id + '?download=1') : 
+            (fileUrl + (fileUrl.includes('?') ? '&download=1' : '?download=1'));
           area.innerHTML = \`
             <div style="text-align:center;padding:12px 0;">
               \${item.type === 'image' ? \`<img src="\${fileUrl}" style="max-height:160px;border-radius:8px;margin-bottom:12px;border:1px solid var(--border);">\` : '<div style="font-size:36px;margin-bottom:8px;">📦</div>'}
               <div style="font-weight:700;margin-bottom:12px;">\${escapeHtml(item.filename)}</div>
-              <a class="btn" style="text-decoration:none;" href="\${fileUrl}?download=1" download="\${escapeHtml(item.filename)}">⬇️ 立即下载此文件</a>
+              <a class="btn" style="text-decoration:none;" href="\${downloadUrl}" download="\${escapeHtml(item.filename)}">⬇️ 立即下载此文件</a>
             </div>
           \`;
           btn.style.display = 'none';
