@@ -144,6 +144,14 @@ export default {
 
       const shouldBurn = clip.burn_after_reading === 1;
 
+      // Case 0: High-Stability Card-Free Relay URL (Litterbox / Tmpfiles)
+      if (clip.content && (clip.content.startsWith('http://') || clip.content.startsWith('https://'))) {
+        if (shouldBurn) {
+          await env.DB.prepare('DELETE FROM clips WHERE id = ?').bind(clip.id).run();
+        }
+        return Response.redirect(clip.content, 302);
+      }
+
       // Case A: Legacy Base64 URI
       if (clip.content && clip.content.startsWith('data:')) {
         const commaIdx = clip.content.indexOf(',');
@@ -303,7 +311,13 @@ export default {
               return json({ error: '文件过大，单文件上限为 100MB' }, 400);
             }
 
-            if (env.BUCKET) {
+            if (fileSize <= 2 * 1024 * 1024) {
+              // Engine 1: Pure D1 (< 2MB) - 100% Private in edge SQLite
+              const buffer = await file.arrayBuffer();
+              const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+              content = `data:${mimeType};base64,${base64}`;
+            } else if (env.BUCKET) {
+              // Optional: Cloudflare R2
               const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
               const r2Key = `files/${currentUser.userId}/${clipId}_${safeName}`;
               await env.BUCKET.put(r2Key, file.stream(), {
@@ -311,12 +325,52 @@ export default {
               });
               content = r2Key;
             } else {
-              if (fileSize > 2 * 1024 * 1024) {
-                return json({ error: '尚未在 Cloudflare 绑定 clip-files 存储桶，D1 仅支持 2MB 内小文件。请配置 R2' }, 400);
+              // Engine 2: Card-Free High-Stability Relay (Up to 1GB)
+              // Primary: Litterbox (by Catbox.moe) - 1GB limit, 9 years uptime since 2017
+              try {
+                const litterForm = new FormData();
+                litterForm.append('reqtype', 'fileupload');
+                litterForm.append('time', '24h');
+                litterForm.append('fileToUpload', file, filename);
+
+                const litterRes = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
+                  method: 'POST',
+                  body: litterForm
+                });
+
+                if (litterRes.ok) {
+                  const urlText = (await litterRes.text()).trim();
+                  if (urlText.startsWith('http://') || urlText.startsWith('https://')) {
+                    content = urlText;
+                  }
+                }
+              } catch (err) {
+                console.error('Litterbox upload error, attempting fallback:', err);
               }
-              const buffer = await file.arrayBuffer();
-              const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
-              content = `data:${mimeType};base64,${base64}`;
+
+              // Backup Fallback: Tmpfiles.org
+              if (!content) {
+                try {
+                  const tmpForm = new FormData();
+                  tmpForm.append('file', file, filename);
+                  const tmpRes = await fetch('https://tmpfiles.org/api/v1/upload', {
+                    method: 'POST',
+                    body: tmpForm
+                  });
+                  if (tmpRes.ok) {
+                    const tmpData = await tmpRes.json();
+                    if (tmpData.status === 'success' && tmpData.data?.url) {
+                      content = tmpData.data.url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+                    }
+                  }
+                } catch (err) {
+                  console.error('Tmpfiles fallback upload error:', err);
+                }
+              }
+
+              if (!content) {
+                return json({ error: '安全中转存储服务连接超时，请重试' }, 502);
+              }
             }
           } else {
             const body = await request.json();
@@ -814,9 +868,9 @@ const frontendHtml = `<!DOCTYPE html>
         </div>
 
         <div class="form-group">
-          <label>或者上传文件（图片/视频/压缩包/文档，最大 100MB）：</label>
+          <label>或者上传文件（支持小截图/代码，或大视频/压缩包，最大 1GB）：</label>
           <div class="file-drop" id="fileDropZone" onclick="document.getElementById('hiddenFileInput').click()">
-            <span id="fileDropLabel">📁 点击选择文件 或 拖放文件到此 (最大 100MB)</span>
+            <span id="fileDropLabel">📁 点击选择文件 或 拖放文件到此 (最大 1GB，传完即可关机)</span>
             <input type="file" id="hiddenFileInput" style="display:none;" onchange="handleFileSelect(this.files)">
           </div>
         </div>
@@ -957,16 +1011,16 @@ const frontendHtml = `<!DOCTYPE html>
     function handleFileSelect(files) {
       if (!files || files.length === 0) return;
       const file = files[0];
-      if (file.size > 100 * 1024 * 1024) {
-        showToast('⚠️ 文件过大，单文件最大支持 100MB', 'error');
+      if (file.size > 1024 * 1024 * 1024) {
+        showToast('⚠️ 文件过大，单文件最大支持 1GB', 'error');
         return;
       }
       selectedFileObject = file;
       const dropLabel = document.getElementById('fileDropLabel');
-      const sizeStr = file.size > 1024 * 1024 ? 
-        (file.size / (1024 * 1024)).toFixed(2) + ' MB' : 
-        (file.size / 1024).toFixed(1) + ' KB';
-      dropLabel.innerHTML = '✅ 已选择: <b>' + escapeHtml(file.name) + '</b> (' + sizeStr + ')';
+      const sizeStr = file.size > 1024 * 1024 * 1024 ? 
+        (file.size / (1024 * 1024 * 1024)).toFixed(2) + ' GB' : 
+        (file.size > 1024 * 1024 ? (file.size / (1024 * 1024)).toFixed(1) + ' MB' : (file.size / 1024).toFixed(0) + ' KB');
+      dropLabel.innerHTML = '✅ 已选定: <b>' + escapeHtml(file.name) + '</b> (' + sizeStr + ')';
       showToast('已载入文件: ' + file.name + ' (' + sizeStr + ')', 'success');
     }
 
@@ -1116,8 +1170,55 @@ const frontendHtml = `<!DOCTYPE html>
 
       try {
         if (selectedFileObject) {
-          const sizeMb = (selectedFileObject.size / (1024 * 1024)).toFixed(1);
-          btn.innerText = '正在流式上传 (' + sizeMb + ' MB)...';
+          const sizeStr = selectedFileObject.size > 1024 * 1024 * 1024 ? 
+            (selectedFileObject.size / (1024 * 1024 * 1024)).toFixed(2) + ' GB' : 
+            (selectedFileObject.size > 1024 * 1024 ? (selectedFileObject.size / (1024 * 1024)).toFixed(1) + ' MB' : (selectedFileObject.size / 1024).toFixed(0) + ' KB');
+          btn.innerText = '正在极速中转 (' + sizeStr + ')...';
+
+          // If file > 80MB, upload directly to Litterbox from browser to bypass Worker 100MB body limit
+          if (selectedFileObject.size > 80 * 1024 * 1024) {
+            btn.innerText = '正在大文件直传 (' + sizeStr + ')...';
+            const directForm = new FormData();
+            directForm.append('reqtype', 'fileupload');
+            directForm.append('time', '24h');
+            directForm.append('fileToUpload', selectedFileObject);
+
+            let directUrl = '';
+            try {
+              const directRes = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
+                method: 'POST',
+                body: directForm
+              });
+              if (directRes.ok) {
+                const txt = (await directRes.text()).trim();
+                if (txt.startsWith('http://') || txt.startsWith('https://')) directUrl = txt;
+              }
+            } catch (err) {
+              console.warn('Direct upload error:', err);
+            }
+
+            if (directUrl) {
+              const res = await fetch('/api/clips', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': 'Bearer ' + token
+                },
+                body: JSON.stringify({
+                  type: selectedFileObject.type.startsWith('image/') ? 'image' : 'file',
+                  content: directUrl,
+                  filename: selectedFileObject.name,
+                  mimeType: selectedFileObject.type,
+                  fileSize: selectedFileObject.size,
+                  ttl: document.getElementById('clipTtl').value,
+                  burn: document.getElementById('clipBurn').checked
+                })
+              });
+              const data = await res.json();
+              handlePublishResponse(data);
+              return;
+            }
+          }
 
           const fd = new FormData();
           fd.append('file', selectedFileObject);
@@ -1169,8 +1270,8 @@ const frontendHtml = `<!DOCTYPE html>
         document.getElementById('clipText').value = '';
         selectedFileObject = null;
         document.getElementById('hiddenFileInput').value = '';
-        document.getElementById('fileDropLabel').innerText = '📁 点击选择文件 或 拖放文件到此 (最大 100MB)';
-        showToast('🚀 已同步到私密流，多端秒级互通！', 'success');
+        document.getElementById('fileDropLabel').innerText = '📁 点击选择文件 或 拖放文件到此 (最大 1GB，传完即可关机)';
+        showToast('🚀 已同步到私密流，传完即可关电脑！', 'success');
         loadClips();
       } else {
         showToast(data.error || '上传同步失败', 'error');
@@ -1199,9 +1300,11 @@ const frontendHtml = `<!DOCTYPE html>
         const isImg = c.type === 'image';
         const isFile = c.type === 'file' || isImg;
         const timeStr = new Date(c.created_at).toLocaleTimeString();
-        const fileUrl = c.content.startsWith('data:') ? c.content : '/api/files/' + c.id;
+        const fileUrl = (c.content.startsWith('http://') || c.content.startsWith('https://')) ? 
+          c.content : 
+          (c.content.startsWith('data:') ? c.content : '/api/files/' + c.id);
         const sizeStr = c.file_size ? 
-          (c.file_size > 1024 * 1024 ? (c.file_size / (1024 * 1024)).toFixed(2) + ' MB' : (c.file_size / 1024).toFixed(1) + ' KB') : '';
+          (c.file_size > 1024 * 1024 * 1024 ? (c.file_size / (1024 * 1024 * 1024)).toFixed(2) + ' GB' : (c.file_size > 1024 * 1024 ? (c.file_size / (1024 * 1024)).toFixed(1) + ' MB' : (c.file_size / 1024).toFixed(0) + ' KB')) : '';
 
         return \`
           <div class="clip-item">
@@ -1341,7 +1444,9 @@ const frontendHtml = `<!DOCTYPE html>
         currentGuestText = item.content;
 
         if (item.type === 'file' || item.type === 'image') {
-          const fileUrl = item.content.startsWith('data:') ? item.content : '/api/files/' + item.id;
+          const fileUrl = (item.content.startsWith('http://') || item.content.startsWith('https://')) ? 
+            item.content : 
+            (item.content.startsWith('data:') ? item.content : '/api/files/' + item.id);
           area.innerHTML = \`
             <div style="text-align:center;padding:12px 0;">
               \${item.type === 'image' ? \`<img src="\${fileUrl}" style="max-height:160px;border-radius:8px;margin-bottom:12px;border:1px solid var(--border);">\` : '<div style="font-size:36px;margin-bottom:8px;">📦</div>'}

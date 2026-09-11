@@ -9,10 +9,13 @@ binding = "DB"
 database_name = "clip-db"
 database_id = "your-database-id-from-cloudflare"
 
-# Cloudflare R2 Object Storage (100MB uploads, 10GB free tier, $0 egress)
-[[r2_buckets]]
-binding = "BUCKET"
-bucket_name = "clip-files"
+# 100% Card-Free Architecture:
+# - Small files & text (<2MB): Stored in private D1 SQLite database
+# - Large files (>2MB up to 1GB): Uploaded to high-stability relay with dual-provider fallback
+# (Optional R2 binding can be enabled if you have a card, but is NOT required)
+# [[r2_buckets]]
+# binding = "BUCKET"
+# bucket_name = "clip-files"
 
 # Optional Custom Domain Routing
 # routes = [
