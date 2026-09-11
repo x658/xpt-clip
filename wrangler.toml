@@ -9,6 +9,11 @@ binding = "DB"
 database_name = "clip-db"
 database_id = "your-database-id-from-cloudflare"
 
+# Cloudflare R2 Object Storage (100MB uploads, 10GB free tier, $0 egress)
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "clip-files"
+
 # Optional Custom Domain Routing
 # routes = [
 #   { pattern = "clip.xptdev.com", custom_domain = true }

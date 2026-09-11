@@ -15,8 +15,8 @@ export default {
     const url = new URL(request.url);
     const { pathname, searchParams } = url;
 
-    // Background asynchronous cleanup of expired clips
-    cleanupExpiredClips(env.DB).catch(() => {});
+    // Background asynchronous cleanup of expired clips & R2 storage
+    cleanupExpiredClips(env).catch(() => {});
 
     // ========================================================
     // 1. PUBLIC AUTHENTICATION & ACCESS APIS
@@ -122,12 +122,74 @@ export default {
         return json({ error: '提取码不存在、已过期或已被提取销毁' }, 404);
       }
 
-      // Burn after reading if configured
-      if (clip.burn_after_reading === 1) {
+      // Burn after reading if configured (text burns immediately; file burns upon download)
+      if (clip.burn_after_reading === 1 && clip.type === 'text') {
         await env.DB.prepare('DELETE FROM clips WHERE id = ?').bind(clip.id).run();
       }
 
       return json({ success: true, data: clip });
+    }
+
+    // GET /api/files/:id (Stream file from Cloudflare R2 or legacy Base64)
+    const fileMatch = pathname.match(/^\/api\/files\/([^\/]+)$/);
+    if (fileMatch && request.method === 'GET') {
+      const clipId = fileMatch[1];
+      const clip = await env.DB.prepare(
+        'SELECT * FROM clips WHERE id = ? AND (expires_at IS NULL OR expires_at > ?)'
+      ).bind(clipId, Date.now()).first();
+
+      if (!clip) {
+        return new Response('文件不存在、已过期或已被销毁', { status: 404 });
+      }
+
+      const shouldBurn = clip.burn_after_reading === 1;
+
+      // Case A: Legacy Base64 URI
+      if (clip.content && clip.content.startsWith('data:')) {
+        const commaIdx = clip.content.indexOf(',');
+        const mime = clip.mime_type || 'application/octet-stream';
+        const base64Data = clip.content.slice(commaIdx + 1);
+        const binaryStr = atob(base64Data);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) {
+          bytes[i] = binaryStr.charCodeAt(i);
+        }
+
+        if (shouldBurn) {
+          await env.DB.prepare('DELETE FROM clips WHERE id = ?').bind(clip.id).run();
+        }
+
+        const headers = new Headers();
+        headers.set('Content-Type', mime);
+        if (searchParams.get('download') === '1') {
+          headers.set('Content-Disposition', `attachment; filename="${encodeURIComponent(clip.filename || 'file')}"`);
+        }
+        return new Response(bytes, { headers });
+      }
+
+      // Case B: Cloudflare R2 Object Storage
+      if (env.BUCKET) {
+        const obj = await env.BUCKET.get(clip.content);
+        if (!obj) {
+          return new Response('文件已在存储空间中被清理', { status: 404 });
+        }
+
+        if (shouldBurn) {
+          await env.BUCKET.delete(clip.content).catch(() => {});
+          await env.DB.prepare('DELETE FROM clips WHERE id = ?').bind(clip.id).run();
+        }
+
+        const headers = new Headers();
+        obj.writeHttpMetadata(headers);
+        headers.set('etag', obj.httpEtag);
+        headers.set('Content-Type', clip.mime_type || headers.get('Content-Type') || 'application/octet-stream');
+        if (searchParams.get('download') === '1') {
+          headers.set('Content-Disposition', `attachment; filename="${encodeURIComponent(clip.filename || 'download')}"`);
+        }
+        return new Response(obj.body, { headers });
+      }
+
+      return new Response('未绑定 R2 存储桶', { status: 500 });
     }
 
     // ========================================================
@@ -184,11 +246,17 @@ export default {
         return json({ success: true, shareCode: randomCode });
       }
 
-      // 2. DELETE /api/clips/:id
+      // 2. DELETE /api/clips/:id (Reclaim R2 space & delete record)
       const deleteMatch = pathname.match(/^\/api\/clips\/([^\/]+)$/);
       if (deleteMatch && request.method === 'DELETE') {
         const clipId = deleteMatch[1];
-        await env.DB.prepare('DELETE FROM clips WHERE id = ? AND user_id = ?').bind(clipId, currentUser.userId).run();
+        const clip = await env.DB.prepare('SELECT * FROM clips WHERE id = ? AND user_id = ?').bind(clipId, currentUser.userId).first();
+        if (clip) {
+          if ((clip.type === 'file' || clip.type === 'image') && env.BUCKET && clip.content && !clip.content.startsWith('data:')) {
+            await env.BUCKET.delete(clip.content).catch(() => {});
+          }
+          await env.DB.prepare('DELETE FROM clips WHERE id = ? AND user_id = ?').bind(clipId, currentUser.userId).run();
+        }
         return json({ success: true });
       }
 
@@ -200,22 +268,73 @@ export default {
         return json({ success: true, clips: rows.results || [] });
       }
 
-      // 4. POST /api/clips (New clip)
+      // 4. POST /api/clips (New clip: supports text JSON & multipart file streaming to R2)
       if (pathname === '/api/clips' && request.method === 'POST') {
         try {
-          const body = await request.json();
-          const { type, content, filename, mimeType, fileSize, ttl, burn } = body;
-          if (!content) {
-            return json({ error: '传输内容不能为空' }, 400);
-          }
-
+          const contentType = request.headers.get('content-type') || '';
           const clipId = 'c_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-          const expiresAt = ttl && Number(ttl) > 0 ? Date.now() + Number(ttl) * 1000 : null;
 
-          let displayTitle = filename;
-          if (!displayTitle) {
-            displayTitle = type === 'file' ? '上传文件' : (content.length > 30 ? content.slice(0, 30) + '...' : content);
+          let type = 'text';
+          let displayTitle = '';
+          let content = '';
+          let filename = '';
+          let mimeType = 'text/plain';
+          let fileSize = 0;
+          let ttl = null;
+          let burn = 0;
+
+          if (contentType.includes('multipart/form-data')) {
+            const formData = await request.formData();
+            const file = formData.get('file');
+            ttl = formData.get('ttl');
+            burn = formData.get('burn') === '1' ? 1 : 0;
+
+            if (!file || typeof file === 'string') {
+              return json({ error: '未选择有效文件' }, 400);
+            }
+
+            filename = file.name || 'unnamed_file';
+            mimeType = file.type || 'application/octet-stream';
+            fileSize = file.size || 0;
+            type = mimeType.startsWith('image/') ? 'image' : 'file';
+            displayTitle = filename;
+
+            if (fileSize > 100 * 1024 * 1024) {
+              return json({ error: '文件过大，单文件上限为 100MB' }, 400);
+            }
+
+            if (env.BUCKET) {
+              const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+              const r2Key = `files/${currentUser.userId}/${clipId}_${safeName}`;
+              await env.BUCKET.put(r2Key, file.stream(), {
+                httpMetadata: { contentType: mimeType }
+              });
+              content = r2Key;
+            } else {
+              if (fileSize > 2 * 1024 * 1024) {
+                return json({ error: '尚未在 Cloudflare 绑定 clip-files 存储桶，D1 仅支持 2MB 内小文件。请配置 R2' }, 400);
+              }
+              const buffer = await file.arrayBuffer();
+              const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+              content = `data:${mimeType};base64,${base64}`;
+            }
+          } else {
+            const body = await request.json();
+            type = body.type || 'text';
+            content = body.content;
+            filename = body.filename || '';
+            mimeType = body.mimeType || 'text/plain';
+            fileSize = body.fileSize || 0;
+            ttl = body.ttl;
+            burn = body.burn ? 1 : 0;
+            displayTitle = filename || (content.length > 30 ? content.slice(0, 30) + '...' : content);
+
+            if (!content) {
+              return json({ error: '传输内容不能为空' }, 400);
+            }
           }
+
+          const expiresAt = ttl && Number(ttl) > 0 ? Date.now() + Number(ttl) * 1000 : null;
 
           // Resilient insert: tries 11 columns, falls back to 10 columns if file_size column not yet added
           try {
@@ -224,13 +343,13 @@ export default {
             ).bind(
               clipId,
               currentUser.userId,
-              type || 'text',
+              type,
               displayTitle,
               content,
-              filename || '',
-              mimeType || 'text/plain',
-              fileSize || 0,
-              burn ? 1 : 0,
+              filename,
+              mimeType,
+              fileSize,
+              burn,
               expiresAt,
               Date.now()
             ).run();
@@ -241,12 +360,12 @@ export default {
               ).bind(
                 clipId,
                 currentUser.userId,
-                type || 'text',
+                type,
                 displayTitle,
                 content,
-                filename || '',
-                mimeType || 'text/plain',
-                burn ? 1 : 0,
+                filename,
+                mimeType,
+                burn,
                 expiresAt,
                 Date.now()
               ).run();
@@ -278,9 +397,23 @@ export default {
 // UTILITY & SECURITY FUNCTIONS
 // ========================================================
 
-async function cleanupExpiredClips(db) {
-  const now = Date.now();
-  await db.prepare('DELETE FROM clips WHERE expires_at IS NOT NULL AND expires_at < ?').bind(now).run();
+async function cleanupExpiredClips(env) {
+  try {
+    if (!env || !env.DB) return;
+    const now = Date.now();
+    const expired = await env.DB.prepare(
+      'SELECT id, type, content FROM clips WHERE expires_at IS NOT NULL AND expires_at < ?'
+    ).bind(now).all();
+
+    if (expired.results && expired.results.length > 0) {
+      for (const clip of expired.results) {
+        if ((clip.type === 'file' || clip.type === 'image') && env.BUCKET && clip.content && !clip.content.startsWith('data:')) {
+          await env.BUCKET.delete(clip.content).catch(() => {});
+        }
+      }
+      await env.DB.prepare('DELETE FROM clips WHERE expires_at IS NOT NULL AND expires_at < ?').bind(now).run();
+    }
+  } catch (e) {}
 }
 
 async function hashPassword(password, salt) {
@@ -681,9 +814,9 @@ const frontendHtml = `<!DOCTYPE html>
         </div>
 
         <div class="form-group">
-          <label>或者上传小文件（图片/压缩包/文档 < 15MB）：</label>
+          <label>或者上传文件（图片/视频/压缩包/文档，最大 100MB）：</label>
           <div class="file-drop" id="fileDropZone" onclick="document.getElementById('hiddenFileInput').click()">
-            <span id="fileDropLabel">📁 点击选择文件 或 拖放文件到此</span>
+            <span id="fileDropLabel">📁 点击选择文件 或 拖放文件到此 (最大 100MB)</span>
             <input type="file" id="hiddenFileInput" style="display:none;" onchange="handleFileSelect(this.files)">
           </div>
         </div>
@@ -824,14 +957,17 @@ const frontendHtml = `<!DOCTYPE html>
     function handleFileSelect(files) {
       if (!files || files.length === 0) return;
       const file = files[0];
-      if (file.size > 15 * 1024 * 1024) {
-        showToast('⚠️ 文件过大，请选择 15MB 以内的小文件', 'error');
+      if (file.size > 100 * 1024 * 1024) {
+        showToast('⚠️ 文件过大，单文件最大支持 100MB', 'error');
         return;
       }
       selectedFileObject = file;
       const dropLabel = document.getElementById('fileDropLabel');
-      dropLabel.innerHTML = '✅ 已选择: <b>' + escapeHtml(file.name) + '</b> (' + (file.size / 1024).toFixed(1) + ' KB)';
-      showToast('已载入文件: ' + file.name, 'success');
+      const sizeStr = file.size > 1024 * 1024 ? 
+        (file.size / (1024 * 1024)).toFixed(2) + ' MB' : 
+        (file.size / 1024).toFixed(1) + ' KB';
+      dropLabel.innerHTML = '✅ 已选择: <b>' + escapeHtml(file.name) + '</b> (' + sizeStr + ')';
+      showToast('已载入文件: ' + file.name + ' (' + sizeStr + ')', 'success');
     }
 
     // Bind specific drop zone
@@ -974,30 +1110,48 @@ const frontendHtml = `<!DOCTYPE html>
       }
 
       const btn = document.getElementById('btnPublish');
-      btn.innerText = '正在上传同步...';
       btn.disabled = true;
 
-      try {
-        const payload = {
-          ttl: document.getElementById('clipTtl').value,
-          burn: document.getElementById('clipBurn').checked
-        };
+      const token = localStorage.getItem('xpt_token');
 
+      try {
         if (selectedFileObject) {
-          const reader = new FileReader();
-          reader.readAsDataURL(selectedFileObject);
-          reader.onload = async () => {
-            payload.type = selectedFileObject.type.startsWith('image/') ? 'image' : 'file';
-            payload.content = reader.result;
-            payload.filename = selectedFileObject.name;
-            payload.mimeType = selectedFileObject.type;
-            payload.fileSize = selectedFileObject.size;
-            await postClipApi(payload);
-          };
+          const sizeMb = (selectedFileObject.size / (1024 * 1024)).toFixed(1);
+          btn.innerText = '正在流式上传 (' + sizeMb + ' MB)...';
+
+          const fd = new FormData();
+          fd.append('file', selectedFileObject);
+          fd.append('ttl', document.getElementById('clipTtl').value);
+          if (document.getElementById('clipBurn').checked) {
+            fd.append('burn', '1');
+          }
+
+          const res = await fetch('/api/clips', {
+            method: 'POST',
+            headers: {
+              'Authorization': 'Bearer ' + token
+            },
+            body: fd
+          });
+          const data = await res.json();
+          handlePublishResponse(data);
         } else {
-          payload.type = 'text';
-          payload.content = text;
-          await postClipApi(payload);
+          btn.innerText = '正在同步中...';
+          const res = await fetch('/api/clips', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + token
+            },
+            body: JSON.stringify({
+              type: 'text',
+              content: text,
+              ttl: document.getElementById('clipTtl').value,
+              burn: document.getElementById('clipBurn').checked
+            })
+          });
+          const data = await res.json();
+          handlePublishResponse(data);
         }
       } catch (e) {
         showToast('发送失败: ' + e.message, 'error');
@@ -1006,17 +1160,7 @@ const frontendHtml = `<!DOCTYPE html>
       }
     }
 
-    async function postClipApi(payload) {
-      const token = localStorage.getItem('xpt_token');
-      const res = await fetch('/api/clips', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + token
-        },
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
+    function handlePublishResponse(data) {
       const btn = document.getElementById('btnPublish');
       btn.innerText = '🚀 发送到我的私密流';
       btn.disabled = false;
@@ -1025,8 +1169,8 @@ const frontendHtml = `<!DOCTYPE html>
         document.getElementById('clipText').value = '';
         selectedFileObject = null;
         document.getElementById('hiddenFileInput').value = '';
-        document.getElementById('fileDropLabel').innerText = '📁 点击选择文件 或 拖放文件到此';
-        showToast('🚀 已同步到私密流，手机刷新即可看到！', 'success');
+        document.getElementById('fileDropLabel').innerText = '📁 点击选择文件 或 拖放文件到此 (最大 100MB)';
+        showToast('🚀 已同步到私密流，多端秒级互通！', 'success');
         loadClips();
       } else {
         showToast(data.error || '上传同步失败', 'error');
@@ -1055,20 +1199,24 @@ const frontendHtml = `<!DOCTYPE html>
         const isImg = c.type === 'image';
         const isFile = c.type === 'file' || isImg;
         const timeStr = new Date(c.created_at).toLocaleTimeString();
+        const fileUrl = c.content.startsWith('data:') ? c.content : '/api/files/' + c.id;
+        const sizeStr = c.file_size ? 
+          (c.file_size > 1024 * 1024 ? (c.file_size / (1024 * 1024)).toFixed(2) + ' MB' : (c.file_size / 1024).toFixed(1) + ' KB') : '';
+
         return \`
           <div class="clip-item">
             <div class="clip-header">
-              <span>\${isImg ? '🖼️ 图片' : (isFile ? '📦 文件' : '📝 文本')} · \${timeStr}</span>
-              \${c.share_code ? \`<span class="badge-pro" style="color:#10b981;border-color:rgba(16,185,129,0.3);">分享码: \${c.share_code}</span>\` : ''}
+              <span>\${isImg ? '🖼️ 图片' : (isFile ? '📦 文件' : '📝 文本')} · \${timeStr} \${sizeStr ? \`<span style="opacity:0.75;">(\${sizeStr})</span>\` : ''}</span>
+              \${c.share_code ? \`<span class="badge-pro" style="color:#10b981;border-color:rgba(16,185,129,0.3);">提取码: \${c.share_code}</span>\` : ''}
             </div>
 
-            \${isImg ? \`<img src="\${c.content}" class="clip-img-thumb" alt="\${escapeHtml(c.filename)}">\` : ''}
+            \${isImg ? \`<img src="\${fileUrl}" class="clip-img-thumb" alt="\${escapeHtml(c.filename)}">\` : ''}
 
-            <div class="clip-content">\${isFile ? escapeHtml(c.filename) : escapeHtml(c.content)}</div>
+            <div class="clip-content">\${isFile ? '📄 ' + escapeHtml(c.filename) : escapeHtml(c.content)}</div>
 
             <div class="clip-actions">
               \${isFile ? 
-                \`<a class="btn-sm" href="\${c.content}" download="\${escapeHtml(c.filename)}">⬇️ 下载文件</a>\` :
+                \`<a class="btn-sm" href="\${fileUrl}?download=1" download="\${escapeHtml(c.filename)}">⬇️ 下载文件</a>\` :
                 \`<button class="btn-sm" onclick="copyClipById('\${c.id}')">📋 一键复制</button>\`
               }
               <button class="btn-sm" style="color:var(--accent);" onclick="requestShareCode('\${c.id}')">🔗 生成临时提取码</button>
@@ -1193,11 +1341,12 @@ const frontendHtml = `<!DOCTYPE html>
         currentGuestText = item.content;
 
         if (item.type === 'file' || item.type === 'image') {
+          const fileUrl = item.content.startsWith('data:') ? item.content : '/api/files/' + item.id;
           area.innerHTML = \`
             <div style="text-align:center;padding:12px 0;">
-              \${item.type === 'image' ? \`<img src="\${item.content}" style="max-height:160px;border-radius:8px;margin-bottom:12px;border:1px solid var(--border);">\` : '<div style="font-size:36px;margin-bottom:8px;">📦</div>'}
+              \${item.type === 'image' ? \`<img src="\${fileUrl}" style="max-height:160px;border-radius:8px;margin-bottom:12px;border:1px solid var(--border);">\` : '<div style="font-size:36px;margin-bottom:8px;">📦</div>'}
               <div style="font-weight:700;margin-bottom:12px;">\${escapeHtml(item.filename)}</div>
-              <a class="btn" style="text-decoration:none;" href="\${item.content}" download="\${escapeHtml(item.filename)}">⬇️ 立即下载此文件</a>
+              <a class="btn" style="text-decoration:none;" href="\${fileUrl}?download=1" download="\${escapeHtml(item.filename)}">⬇️ 立即下载此文件</a>
             </div>
           \`;
           btn.style.display = 'none';
