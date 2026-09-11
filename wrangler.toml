@@ -3,11 +3,16 @@ main = "src/worker.js"
 compatibility_date = "2024-09-01"
 compatibility_flags = [ "nodejs_compat" ]
 
+# Custom Domain Routing
+routes = [
+  { pattern = "clip.xptdev.com", custom_domain = true }
+]
+
 # Cloudflare D1 Database Binding
 [[d1_databases]]
 binding = "DB"
 database_name = "clip-db"
-database_id = "your-database-id-from-cloudflare"
+database_id = "920eae6d-b99f-4373-83da-725c07a98e8b"
 
 # 100% Card-Free Architecture:
 # - Small files & text (<2MB): Stored in private D1 SQLite database
@@ -16,8 +21,3 @@ database_id = "your-database-id-from-cloudflare"
 # [[r2_buckets]]
 # binding = "BUCKET"
 # bucket_name = "clip-files"
-
-# Optional Custom Domain Routing
-# routes = [
-#   { pattern = "clip.xptdev.com", custom_domain = true }
-# ]
