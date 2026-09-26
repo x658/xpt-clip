@@ -366,43 +366,43 @@ export default {
               });
               content = r2Key;
             } else {
-              // Engine 2: Card-Free High-Stability Dual Relay (Up to 1GB)
-              // Primary Relay: Filebin.net (AWS S3 storage, 6-day retention, direct download)
+              // Engine 2: Card-Free High-Stability Dual Relay (Up to 100MB via Worker Edge Proxy / 1GB)
+              // Primary Relay: Tmpfiles.org (Tokyo/France Cloudflare Edge, lightning fast)
               try {
-                const binId = 'xpt_' + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
-                const safeName = encodeURIComponent(filename.replace(/[^a-zA-Z0-9._-]/g, '_'));
-                const filebinRes = await fetch(`https://filebin.net/${binId}/${safeName}`, {
+                const tmpForm = new FormData();
+                tmpForm.append('file', file, filename);
+                const tmpRes = await fetch('https://tmpfiles.org/api/v1/upload', {
                   method: 'POST',
-                  headers: {
-                    'Content-Type': mimeType,
-                    'filename': safeName
-                  },
-                  body: file.stream()
+                  body: tmpForm
                 });
-                if (filebinRes.status === 201 || filebinRes.ok) {
-                  content = `https://filebin.net/${binId}/${safeName}`;
+                if (tmpRes.ok) {
+                  const tmpData = await tmpRes.json();
+                  if (tmpData.status === 'success' && tmpData.data?.url) {
+                    content = tmpData.data.url;
+                  }
                 }
               } catch (err) {
-                console.error('Filebin backend relay upload error:', err);
+                console.error('Tmpfiles relay upload error:', err);
               }
 
-              // Backup Fallback: Tmpfiles.org (Cloudflare CDN)
+              // Backup Fallback: Filebin.net (AWS S3)
               if (!content) {
                 try {
-                  const tmpForm = new FormData();
-                  tmpForm.append('file', file, filename);
-                  const tmpRes = await fetch('https://tmpfiles.org/api/v1/upload', {
+                  const binId = 'xpt_' + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+                  const safeName = encodeURIComponent(filename.replace(/[^a-zA-Z0-9._-]/g, '_'));
+                  const filebinRes = await fetch(`https://filebin.net/${binId}/${safeName}`, {
                     method: 'POST',
-                    body: tmpForm
+                    headers: {
+                      'Content-Type': mimeType,
+                      'filename': safeName
+                    },
+                    body: file.stream()
                   });
-                  if (tmpRes.ok) {
-                    const tmpData = await tmpRes.json();
-                    if (tmpData.status === 'success' && tmpData.data?.url) {
-                      content = tmpData.data.url;
-                    }
+                  if (filebinRes.status === 201 || filebinRes.ok) {
+                    content = `https://filebin.net/${binId}/${safeName}`;
                   }
                 } catch (err) {
-                  console.error('Tmpfiles fallback upload error:', err);
+                  console.error('Filebin fallback upload error:', err);
                 }
               }
 
@@ -932,7 +932,7 @@ const frontendHtml = `<!DOCTYPE html>
         <div class="form-group">
           <label>或者上传文件（支持小截图/代码，或大视频/压缩包，最大 1GB）：</label>
           <div class="file-drop" id="fileDropZone" onclick="document.getElementById('hiddenFileInput').click()">
-            <span id="fileDropLabel">📁 点击选择文件 或 拖放文件到此 (最大 1GB，传完即可关机)</span>
+            <span id="fileDropLabel">📁 点击选择文件 或 拖放文件到此 (国内免翻墙 95MB，外网支持 1GB)</span>
             <input type="file" id="hiddenFileInput" style="display:none;" onchange="handleFileSelect(this.files)">
           </div>
           <!-- 实时上传进度与速率面板 -->
@@ -1321,7 +1321,7 @@ const frontendHtml = `<!DOCTYPE html>
           };
           xhr.onerror = () => reject(new Error('Tmpfiles 网络异常'));
           xhr.ontimeout = () => reject(new Error('Tmpfiles 超时'));
-          xhr.timeout = 300000;
+          xhr.timeout = 20000;
 
           const fd = new FormData();
           fd.append('file', file);
@@ -1358,7 +1358,7 @@ const frontendHtml = `<!DOCTYPE html>
             };
             xhr.onerror = () => reject(new Error('Filebin 网络连接异常'));
             xhr.ontimeout = () => reject(new Error('Filebin 上传超时'));
-            xhr.timeout = 300000;
+            xhr.timeout = 20000;
 
             xhr.open('POST', targetUrl, true);
             xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
@@ -1371,6 +1371,51 @@ const frontendHtml = `<!DOCTYPE html>
       }
 
       return directUrl;
+    }
+
+    // 国内边缘无感流式上传 (100% 走自建域名，免翻墙，支持实时测速与百分比)
+    function uploadViaWorkerStream(file, token, onProgress) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.upload.addEventListener('progress', onProgress);
+
+        xhr.onreadystatechange = () => {
+          if (xhr.readyState === 4) {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try {
+                const data = JSON.parse(xhr.responseText);
+                resolve(data);
+              } catch (e) {
+                reject(new Error('数据解析异常: ' + xhr.responseText));
+              }
+            } else {
+              try {
+                const errData = JSON.parse(xhr.responseText);
+                reject(new Error(errData.error || ('上传失败，状态码: ' + xhr.status)));
+              } catch (e) {
+                reject(new Error('上传失败，状态码: ' + xhr.status));
+              }
+            }
+          }
+        };
+
+        xhr.onerror = () => reject(new Error('国内边缘通道连接异常，请检查网络'));
+        xhr.ontimeout = () => reject(new Error('上传连接超时，请重试'));
+        xhr.timeout = 300000; // 5分钟
+
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('ttl', document.getElementById('clipTtl').value);
+        if (document.getElementById('clipBurn').checked) {
+          fd.append('burn', '1');
+        }
+
+        xhr.open('POST', '/api/clips', true);
+        if (token) {
+          xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+        }
+        xhr.send(fd);
+      });
     }
 
     // ==========================================
@@ -1419,8 +1464,40 @@ const frontendHtml = `<!DOCTYPE html>
             return;
           }
 
-          // 分支 B: > 2MB ~ 1GB 大文件 -> 客户端单跳直传 + 动态实时百分比/速率监控
-          btn.innerText = '正在专线直传 (' + sizeStr + ')...';
+          // 分支 B: 2MB ~ 95MB (核心日常主力) -> 方案 A: 国内免翻墙边缘专线中转，实时测速+百分比
+          if (file.size <= 95 * 1024 * 1024) {
+            showUploadProgress(true);
+            updateUploadProgress(0, '0 MB', sizeStr, '测速中...', '⚡ 正在开启国内免翻墙边缘专线传输...');
+
+            let lastTime = Date.now();
+            let lastLoaded = 0;
+            let currentSpeed = '计算中...';
+
+            const onProgressHandler = (e) => {
+              if (!e.lengthComputable) return;
+              const now = Date.now();
+              const dt = (now - lastTime) / 1000;
+              if (dt >= 0.25) {
+                const bytesPerSec = (e.loaded - lastLoaded) / dt;
+                const mbPerSec = bytesPerSec / (1024 * 1024);
+                currentSpeed = mbPerSec >= 1 ? mbPerSec.toFixed(1) + ' MB/s' : (bytesPerSec / 1024).toFixed(0) + ' KB/s';
+                lastTime = now;
+                lastLoaded = e.loaded;
+              }
+              const percent = Math.min(99, Math.round((e.loaded / e.total) * 100));
+              const loadedMB = (e.loaded / (1024 * 1024)).toFixed(1) + ' MB';
+              updateUploadProgress(percent, loadedMB, sizeStr, currentSpeed, '⚡ 国内边缘专线传输中...');
+              btn.innerText = '🚀 边缘直传 ' + percent + '% (' + currentSpeed + ')';
+            };
+
+            const data = await uploadViaWorkerStream(file, token, onProgressHandler);
+            updateUploadProgress(100, sizeStr, sizeStr, '完成', '✅ 边缘传输完毕，正在同步剪贴板...');
+            handlePublishResponse(data);
+            return;
+          }
+
+          // 分支 C: > 95MB ~ 1GB 超大文件 -> 尝试 1GB 海外专线直传 (需外网代理)
+          btn.innerText = '正在尝试 1GB 专线直传 (' + sizeStr + ')...';
           let directUrl = await uploadLargeFileDirect(file);
 
           if (directUrl) {
@@ -1446,24 +1523,12 @@ const frontendHtml = `<!DOCTYPE html>
             return;
           }
 
-          // 分支 C (终极保底): 如果浏览器直传受局域网拦截，通过 Worker 进行兜底中转
-          btn.innerText = '正在通过边缘服务器中转 (' + sizeStr + ')...';
-          const fd = new FormData();
-          fd.append('file', file);
-          fd.append('ttl', document.getElementById('clipTtl').value);
-          if (document.getElementById('clipBurn').checked) {
-            fd.append('burn', '1');
-          }
-
-          const res = await fetch('/api/clips', {
-            method: 'POST',
-            headers: {
-              'Authorization': 'Bearer ' + token
-            },
-            body: fd
-          });
-          const data = await res.json();
-          handlePublishResponse(data);
+          // 如果 > 95MB 直传失败，向国内内网用户弹出贴心提示
+          showUploadProgress(false);
+          btn.innerText = '🚀 发送到我的私密流';
+          btn.disabled = false;
+          alert('⚠️ 文件传输提示：\n\n当前文件大小为 ' + sizeStr + '。受 Cloudflare 免费版限制，国内免翻墙边缘通道单文件上限为 95MB。\n\n如需传输 100MB~1GB 超大文件，请开启网络加速/代理后重试，或将文件分卷压缩为 90MB 小包上传。');
+          return;
         } else {
           btn.innerText = '正在同步中...';
           const res = await fetch('/api/clips', {
@@ -1500,7 +1565,7 @@ const frontendHtml = `<!DOCTYPE html>
         document.getElementById('clipText').value = '';
         selectedFileObject = null;
         document.getElementById('hiddenFileInput').value = '';
-        document.getElementById('fileDropLabel').innerText = '📁 点击选择文件 或 拖放文件到此 (最大 1GB，传完即可关机)';
+        document.getElementById('fileDropLabel').innerText = '📁 点击选择文件 或 拖放文件到此 (国内免翻墙 95MB，外网支持 1GB)';
         showToast('🚀 已同步到私密流，传完即可关电脑！', 'success');
         loadClips();
       } else {
