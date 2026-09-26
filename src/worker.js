@@ -1527,7 +1527,8 @@ const frontendHtml = `<!DOCTYPE html>
           showUploadProgress(false);
           btn.innerText = '🚀 发送到我的私密流';
           btn.disabled = false;
-          alert('⚠️ 文件传输提示：\n\n当前文件大小为 ' + sizeStr + '。受 Cloudflare 免费版限制，国内免翻墙边缘通道单文件上限为 95MB。\n\n如需传输 100MB~1GB 超大文件，请开启网络加速/代理后重试，或将文件分卷压缩为 90MB 小包上传。');
+          showToast('⚠️ 文件过大(' + sizeStr + ')：国内免翻墙限 95MB，更大文件请开加速代理', 'error');
+          alert(['⚠️ 文件传输提示：', '', '当前文件大小为 ' + sizeStr + '。受 Cloudflare 免费版限制，国内免翻墙边缘通道单文件上限为 95MB。', '', '如需传输 100MB~1GB 超大文件，请开启网络加速/代理后重试，或将文件分卷压缩为 90MB 小包上传。'].join(String.fromCharCode(10)));
           return;
         } else {
           btn.innerText = '正在同步中...';
